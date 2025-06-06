@@ -1,0 +1,579 @@
+import java.util.*;
+import java.time.*;
+import java.time.temporal.ChronoUnit;
+import java.time.format.DateTimeFormatter;
+import java.util.concurrent.*;
+import java.util.stream.Collectors;
+
+class Constants {
+    public static final int HOURLY_RATE = 300;          // Ставка работников: 300 руб/час
+    public static final int ASSEMBLY_TIME_PER_ITEM = 45; // Время сборки 1 товара: 45 сек
+    public static final int COURIER_PREP_TIME = 120;     // Время подготовки курьера: 120 сек (60+60)
+    public static final int TRAVEL_TIME_PER_UNIT = 30;   // Время на 1 единицу расстояния: 30 сек
+    public static final int DEFAULT_RESTOCK_AMOUNT = 20; // Стандартное кол-во товара при пополнении
+    public static final DateTimeFormatter FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
+}
+
+enum OrderStatus {
+    CREATED,      // Заказ создан
+    PROCESSING,   // Заказ в обработке
+    ASSEMBLING,   // Заказ собирается
+    SENT,         // Заказ отправлен курьером
+    DELIVERED     // Заказ доставлен
+}
+
+enum WorkerStatus {
+    NOT_WORKING,  // Работник не на смене
+    SHIFT_OPEN,   // Смена начата
+    HAS_ORDER,    // Работник выполняет заказ
+    RETURNING     // Курьер возвращается на склад
+}
+
+class Item {
+    private final String name;
+    private final int idInStore;
+    private final int idInProvider;
+    private final int price;
+    private final int providerId;
+
+    public Item(String name, int idInStore, int idInProvider, int price, int providerId) {
+        this.name = name;
+        this.idInStore = idInStore;
+        this.idInProvider = idInProvider;
+        this.price = price;
+        this.providerId = providerId;
+    }
+
+    public String getName() { return name; }
+    public int getIdInStore() { return idInStore; }
+    public int getIdInProvider() { return idInProvider; }
+    public int getProviderId() { return providerId; }
+    public int getPrice() { return price; }
+}
+
+class Order implements Comparable<Order> {
+    private static final Random random = new Random();
+    private final List<Map.Entry<Item, Integer>> goods; //Состав заказа (Список пар "Товар-Количество")
+    private final double[] geolocation;
+    private final LocalDateTime orderCreation; // Дата и время создания
+    private final int orderId;
+    private OrderStatus status;
+    private Integer storekeeperId;
+    private Integer courierId;
+    private LocalDateTime orderDeliveryTime; //Дата и время фактической доставки
+    private final List<Map.Entry<Item, Integer>> goodsInFact = new ArrayList<>(); //Список фактически собранных товаров
+
+    public Order(List<Map.Entry<Item, Integer>> goods, double[] geolocation, LocalDateTime orderCreation) {
+        this.goods = goods;
+        this.geolocation = geolocation;
+        this.orderCreation = orderCreation;
+        this.orderId = random.nextInt(100) + 1;
+        this.status = OrderStatus.CREATED;
+    }
+
+    @Override
+    public int compareTo(Order other) { //Сортировка во время сборки
+        return this.orderCreation.compareTo(other.orderCreation);
+    }
+
+    public List<Map.Entry<Item, Integer>> getGoodsList() { return goods; }
+    public List<Map.Entry<Item, Integer>> getFactGoodsList() { return goodsInFact; }
+    public OrderStatus getStatus() { return status; }
+    public int getOrderId() { return orderId; }
+    public LocalDateTime getCreationTime() { return orderCreation; }
+    public LocalDateTime getDeliveryTime() { return orderDeliveryTime; }
+    public Integer getStorekeeperId() { return storekeeperId; }
+    public Integer getCourierId() { return courierId; }
+    public double[] getGeolocation() { return geolocation; }
+
+    public void setDeliveryTime(LocalDateTime time) { orderDeliveryTime = time; }
+    public void setStorekeeperId(int id) { if (storekeeperId == null) storekeeperId = id; }
+    public void setCourierId(int id) { if (courierId == null) courierId = id; }
+
+    public void nextStatus() {
+        if (status.ordinal() < OrderStatus.values().length - 1) {
+            status = OrderStatus.values()[status.ordinal() + 1];
+        }
+    }
+
+    public void addToFactGoods(Item item, int amount) {
+        goodsInFact.add(new AbstractMap.SimpleEntry<>(item, amount));
+    }
+}
+
+abstract class Worker {
+    protected final int id;
+    protected WorkerStatus status;
+    protected LocalDateTime startShift;
+    protected LocalDateTime endShift;
+    protected Order currentOrder;
+    protected LocalDateTime endTimeWorkingCurrentOrder;
+    protected double[] geolocation;
+    protected int wallet;
+    protected static final Random random = new Random();
+
+    public Worker() {
+        this.id = random.nextInt(1000) + 1;
+        this.status = WorkerStatus.NOT_WORKING;
+    }
+
+    public int getId() { return id; }
+    public WorkerStatus getStatus() { return status; }
+    public LocalDateTime getStartShift() { return startShift; }
+    public LocalDateTime getEndShift() { return endShift; }
+    public Order getCurrentOrder() { return currentOrder; }
+    public LocalDateTime getEndTimeWorkingCurrentOrder() { return endTimeWorkingCurrentOrder; }
+
+    public boolean acceptOrder(Order order, LocalDateTime time) {
+        closeShiftIfEnded(time);
+        if (status == WorkerStatus.SHIFT_OPEN &&
+                !time.isBefore(startShift) && !time.isAfter(endShift)) {
+            currentOrder = order;
+            status = WorkerStatus.HAS_ORDER;
+            return true;
+        }
+        return false;
+    }
+
+    public void startShift(LocalDateTime dateStart, LocalDateTime dateEnd, double[] storeGeolocation) {
+        if (status == WorkerStatus.NOT_WORKING) {
+            startShift = dateStart;
+            geolocation = storeGeolocation;
+            endShift = dateEnd;
+            status = WorkerStatus.SHIFT_OPEN;
+        }
+    }
+
+    public void closeShiftIfEnded(LocalDateTime currentTimestamp, boolean force) {
+        if (force || (endShift != null && currentTimestamp != null && currentTimestamp.isAfter(endShift))) {
+            status = WorkerStatus.NOT_WORKING;
+            long hours = ChronoUnit.HOURS.between(startShift, endShift);
+            wallet = (int) (hours * Constants.HOURLY_RATE);
+
+            System.out.println("------------Worker #" + id + "------------");
+            // Использование форматтера для вывода
+            System.out.println("Worker " + id + " ended shift at " + endShift.format(Constants.FORMATTER) + ", earned " + wallet + " RUB\n");
+
+            startShift = null;
+            endShift = null;
+            currentOrder = null;
+            endTimeWorkingCurrentOrder = null;
+        }
+    }
+
+    public void closeShiftIfEnded(LocalDateTime currentTimestamp) {
+        closeShiftIfEnded(currentTimestamp, false);
+    }
+
+    public void checkOrderCompletion(LocalDateTime currentTime) {
+        if (status == WorkerStatus.HAS_ORDER &&
+                endTimeWorkingCurrentOrder != null &&
+                !currentTime.isBefore(endTimeWorkingCurrentOrder)) {
+
+            status = WorkerStatus.SHIFT_OPEN;
+            currentOrder = null;
+            endTimeWorkingCurrentOrder = null;
+        }
+    }
+}
+
+class Courier extends Worker {
+    private LocalDateTime returnTime; // Время возврата на склад
+
+    public Courier() {
+        super();
+    }
+
+    public LocalDateTime getDeliveryTime() {
+        return endTimeWorkingCurrentOrder;
+    }
+
+    public void calculateDeliveryTime(LocalDateTime startTime) {
+        // Расчет расстояния между складом и адресом доставки
+        double dx = currentOrder.getGeolocation()[0] - geolocation[0];
+        double dy = currentOrder.getGeolocation()[1] - geolocation[1];
+        double distance = Math.sqrt(dx*dx + dy*dy);
+
+        // Расчет времени: расстояние × 30 сек + 120 сек
+        long seconds = (long)(distance * Constants.TRAVEL_TIME_PER_UNIT)
+                + Constants.COURIER_PREP_TIME;
+
+        // Установка времени завершения доставки
+        endTimeWorkingCurrentOrder = startTime.plusSeconds(seconds);
+        currentOrder.setDeliveryTime(endTimeWorkingCurrentOrder);
+    }
+
+    public void startReturn(LocalDateTime deliveryTime) {
+        // Расчет расстояния от адреса доставки до склада
+        double dx = geolocation[0] - currentOrder.getGeolocation()[0];
+        double dy = geolocation[1] - currentOrder.getGeolocation()[1];
+        double distance = Math.sqrt(dx*dx + dy*dy);
+
+        // Расчет времени возврата
+        returnTime = deliveryTime.plusSeconds(
+                (long)(distance * Constants.TRAVEL_TIME_PER_UNIT)
+        );
+        status = WorkerStatus.RETURNING;
+    }
+
+    public boolean isReturnComplete(LocalDateTime currentTime) {
+        if (status == WorkerStatus.RETURNING &&
+                returnTime != null &&
+                currentTime.isAfter(returnTime)) {
+            status = WorkerStatus.SHIFT_OPEN;
+            currentOrder = null; // Заказ полностью завершен
+            return true;
+        }
+        return false;
+    }
+
+    @Override
+    public void checkOrderCompletion(LocalDateTime currentTime) {
+        if (status == WorkerStatus.RETURNING &&
+                returnTime != null &&
+                !currentTime.isBefore(returnTime)) {
+
+            status = WorkerStatus.SHIFT_OPEN;
+            returnTime = null;
+        }
+        super.checkOrderCompletion(currentTime);
+    }
+}
+
+class Storekeeper extends Worker {
+    public Storekeeper() {
+        super();
+    }
+
+    public void calculateAssemblyTime(LocalDateTime startTime, Map<Integer, Integer> storeStock) {
+        int assemblyTime = 0;
+        for (Map.Entry<Item, Integer> entry : currentOrder.getGoodsList()) {
+            Item item = entry.getKey();
+            int amount = entry.getValue();
+            int storeId = item.getIdInStore();
+
+            if (storeStock.containsKey(storeId)) {
+                int available = storeStock.get(storeId);
+                int taken = Math.min(available, amount);
+                assemblyTime += Constants.ASSEMBLY_TIME_PER_ITEM * taken;
+                currentOrder.addToFactGoods(item, taken);
+                storeStock.put(storeId, available - taken);
+            }
+        }
+        endTimeWorkingCurrentOrder = startTime.plusSeconds(assemblyTime);
+    }
+
+    public LocalDateTime getAssemblyEndTime() {
+        return endTimeWorkingCurrentOrder;
+    }
+}
+
+class Provider {
+    private final int id;
+    private final Map<Integer, Integer> stock = new HashMap<>();
+    private final Map<Integer, Item> items = new HashMap<>();
+
+    public Provider(int id, Map<Integer, Item> itemsDatabase) {
+        this.id = id;
+        initializeItems(itemsDatabase);
+        restock();
+    }
+
+    private void initializeItems(Map<Integer, Item> itemsDatabase) {
+        itemsDatabase.values().stream()
+                .filter(item -> item.getProviderId() == id)
+                .forEach(item -> items.put(item.getIdInProvider(), item));
+    }
+
+    public void restock() {
+        items.keySet().forEach(itemId ->
+                stock.put(itemId, Constants.DEFAULT_RESTOCK_AMOUNT));
+    }
+
+    public List<Map.Entry<Item, Integer>> fulfillOrder(List<Map.Entry<Item, Integer>> orderItems) {
+        List<Map.Entry<Item, Integer>> fulfilled = new ArrayList<>();
+
+        for (Map.Entry<Item, Integer> entry : orderItems) {
+            Item item = entry.getKey();
+            int requested = entry.getValue();
+            int available = stock.getOrDefault(item.getIdInProvider(), 0);
+            int toSupply = Math.min(available, requested);
+
+            if (toSupply > 0) {
+                fulfilled.add(new AbstractMap.SimpleEntry<>(item, toSupply));
+                stock.put(item.getIdInProvider(), available - toSupply);
+            }
+        }
+        return fulfilled;
+    }
+
+    public int getId() { return id; }
+}
+
+interface AssignmentStrategy {
+    Worker assignWorker(Order order, List<Worker> availableWorkers, LocalDateTime currentTime);
+}
+
+class DefaultAssignmentStrategy implements AssignmentStrategy {
+    @Override
+    public Worker assignWorker(Order order, List<Worker> availableWorkers, LocalDateTime currentTime) {
+        return availableWorkers.stream()
+                .filter(worker -> worker.acceptOrder(order, currentTime))
+                .findFirst()
+                .orElse(null);
+    }
+}
+
+class Store {
+    private final int id;
+    private final double[] geolocation;
+    private final PriorityBlockingQueue<Order> orderQueue = new PriorityBlockingQueue<>();
+    private final Map<Integer, Provider> providers = new HashMap<>();
+    private final List<Courier> couriers = new ArrayList<>();
+    private final List<Storekeeper> storekeepers = new ArrayList<>();
+    private final Map<Integer, Integer> stock = new HashMap<>();
+    private final Map<Integer, Item> items = new HashMap<>();
+    private final AssignmentStrategy assignmentStrategy;
+    private final Random random = new Random();
+
+    public Store(double[] geolocation, Map<Integer, Item> itemsDatabase, AssignmentStrategy strategy) {
+        this.id = random.nextInt(1000) + 1;
+        this.geolocation = geolocation;
+        this.items.putAll(itemsDatabase);
+        this.assignmentStrategy = strategy;
+        initializeStock();
+    }
+
+    public double[] getGeolocation() {
+        return this.geolocation;
+    }
+
+    private void initializeStock() {
+        items.values().forEach(item -> stock.put(item.getIdInStore(), 0));
+    }
+
+    public void addProvider(Provider provider) {
+        providers.put(provider.getId(), provider);
+    }
+
+    public void addWorker(Worker worker) {
+        if (worker instanceof Courier) {
+            couriers.add((Courier) worker);
+        } else if (worker instanceof Storekeeper) {
+            storekeepers.add((Storekeeper) worker);
+        }
+    }
+
+    public void addOrder(Order order) {
+        orderQueue.add(order);
+    }
+
+    public void processOrders() {
+        while (!orderQueue.isEmpty()) {
+            Order order = orderQueue.poll();
+            LocalDateTime currentTime = order.getCreationTime();
+
+            cleanEndedShifts(currentTime);
+
+            switch (order.getStatus()) {
+                case CREATED -> processCreatedOrder(order, currentTime);
+                case PROCESSING -> processProcessingOrder(order, currentTime);
+                case ASSEMBLING -> processAssemblingOrder(order, currentTime);
+                case SENT -> completeOrder(order);
+            }
+        }
+        finalizeOperations();
+    }
+
+    private void processCreatedOrder(Order order, LocalDateTime currentTime) {
+        System.out.println("------------Order #" + order.getOrderId() + "------------");
+        // Использование форматтера для вывода
+        System.out.println("Created at: " + currentTime.format(Constants.FORMATTER));
+
+        order.nextStatus();
+        orderQueue.add(order);
+        checkStockLevels();
+    }
+
+    private void processProcessingOrder(Order order, LocalDateTime currentTime) {
+        Worker worker = assignmentStrategy.assignWorker(order, new ArrayList<>(storekeepers), currentTime);
+
+        if (worker != null) {
+            ((Storekeeper) worker).calculateAssemblyTime(currentTime, stock);
+            order.setStorekeeperId(worker.getId());
+            order.nextStatus();
+            orderQueue.add(order);
+            System.out.println("Order #" + order.getOrderId() + " assigned to storekeeper");
+        } else {
+            rescheduleOrder(order, storekeepers, currentTime);
+        }
+    }
+
+    private void processAssemblingOrder(Order order, LocalDateTime currentTime) {
+        Worker worker = assignmentStrategy.assignWorker(order, new ArrayList<>(couriers), currentTime);
+
+        if (worker != null) {
+            ((Courier) worker).calculateDeliveryTime(currentTime);
+            order.setCourierId(worker.getId());
+            order.nextStatus();
+            orderQueue.add(order);
+            System.out.println("Order #" + order.getOrderId() + " assigned to courier");
+        } else {
+            rescheduleOrder(order, couriers, currentTime);
+        }
+    }
+
+    private void rescheduleOrder(Order order, List<? extends Worker> workers, LocalDateTime currentTime) {
+        LocalDateTime nextCheck = workers.stream()
+                .filter(w -> w.getStatus() == WorkerStatus.HAS_ORDER || w.getStatus() == WorkerStatus.RETURNING)
+                .map(Worker::getEndTimeWorkingCurrentOrder)
+                .filter(Objects::nonNull)
+                .min(LocalDateTime::compareTo)
+                .orElse(currentTime.plusMinutes(5));
+
+        orderQueue.add(order);
+        // Использование форматтера для вывода
+        System.out.println("Rescheduling order #" + order.getOrderId() + " to " + nextCheck.format(Constants.FORMATTER));
+    }
+
+    private void completeOrder(Order order) {
+        System.out.println("------------Order #" + order.getOrderId() + "------------");
+        // Использование форматтера для вывода
+        System.out.println("Delivered at: " + order.getDeliveryTime().format(Constants.FORMATTER));
+
+        for (Courier courier : couriers) {
+            if (courier.getId() == order.getCourierId()) {
+                courier.startReturn(order.getDeliveryTime());
+                break;
+            }
+        }
+    }
+
+    private void checkStockLevels() {
+        Map<Integer, List<Map.Entry<Item, Integer>>> restockRequests = new HashMap<>();
+
+        stock.entrySet().stream()
+                .filter(entry -> entry.getValue() == 0)
+                .forEach(entry -> {
+                    Item item = items.get(entry.getKey());
+                    int providerId = item.getProviderId();
+                    restockRequests.computeIfAbsent(providerId, k -> new ArrayList<>())
+                            .add(new AbstractMap.SimpleEntry<>(item, Constants.DEFAULT_RESTOCK_AMOUNT));
+                });
+
+        if (!restockRequests.isEmpty()) {
+            System.out.println("------------Store #" + id + "------------");
+            System.out.print("Restocking needed for: ");
+            restockRequests.values().stream()
+                    .flatMap(List::stream)
+                    .map(entry -> entry.getKey().getName())
+                    .forEach(name -> System.out.print(name + ", "));
+            System.out.println();
+        }
+
+        restockRequests.forEach((providerId, itemsList) -> {
+            Provider provider = providers.get(providerId);
+            List<Map.Entry<Item, Integer>> fulfilled = provider.fulfillOrder(itemsList);
+            fulfilled.forEach(entry ->
+                    stock.compute(entry.getKey().getIdInStore(),
+                            (k, v) -> v + entry.getValue()));
+        });
+    }
+
+    private void cleanEndedShifts(LocalDateTime currentTime) {
+        // Для кладовщиков
+        for (Storekeeper storekeeper : storekeepers) {
+            storekeeper.checkOrderCompletion(currentTime);
+            storekeeper.closeShiftIfEnded(currentTime);
+        }
+
+        // Для курьеров
+        for (Courier courier : couriers) {
+            courier.checkOrderCompletion(currentTime);
+            courier.isReturnComplete(currentTime); // Оставляем существующую проверку возврата
+            courier.closeShiftIfEnded(currentTime);
+        }
+    }
+
+    private void finalizeOperations() {
+        System.out.println("------------Store #" + id + "------------");
+        System.out.println("All orders processed");
+
+        // Принудительное завершение смен
+        couriers.forEach(c -> c.closeShiftIfEnded(null, true));
+        storekeepers.forEach(s -> s.closeShiftIfEnded(null, true));
+    }
+}
+
+class User {
+    private final String email;
+    private final double[] geolocation;
+    private final int id;
+    private final List<Order> orders = new ArrayList<>();
+    private static final Random random = new Random();
+
+    public User(String email, double[] geolocation) {
+        this.email = email;
+        this.geolocation = geolocation;
+        this.id = random.nextInt(100) + 1;
+    }
+
+    public void placeOrder(List<Map.Entry<Item, Integer>> items, Store store, LocalDateTime time) {
+        Order order = new Order(items, geolocation, time);
+        orders.add(order);
+        store.addOrder(order);
+        System.out.println("User #" + id + " placed order #" + order.getOrderId());
+    }
+}
+
+public class Main {
+    public static void main(String[] args) {
+        // Инициализация базы товаров
+        Map<Integer, Item> itemsDatabase = new HashMap<>();
+        itemsDatabase.put(1, new Item("Backpack", 1, 28, 400, 50));
+        itemsDatabase.put(2, new Item("Notebook", 2, 36, 50, 50));
+        itemsDatabase.put(3, new Item("Laptop", 3, 4, 10000, 50));
+
+        // Создание склада
+        Store store = new Store(
+                new double[]{0, 0},
+                itemsDatabase,
+                new DefaultAssignmentStrategy()
+        );
+
+        // Добавление поставщика
+        Provider provider = new Provider(50, itemsDatabase);
+        store.addProvider(provider);
+
+        // Создание работников
+        Courier courier = new Courier();
+        Storekeeper storekeeper = new Storekeeper();
+        store.addWorker(courier);
+        store.addWorker(storekeeper);
+
+        // Назначение смен
+        LocalDateTime shiftStart = LocalDateTime.of(2025, 6, 7, 9, 0);
+        LocalDateTime shiftEnd = LocalDateTime.of(2025, 6, 7, 18, 0);
+
+        courier.startShift(shiftStart, shiftEnd, store.getGeolocation());
+        storekeeper.startShift(shiftStart, shiftEnd, store.getGeolocation());
+
+        User user1 = new User("user1@example.com", new double[]{10, 10});
+        User user2 = new User("user2@example.com", new double[]{-5, 7});  // Новый пользователь
+
+        // Формирование заказов
+        List<Map.Entry<Item, Integer>> orderItems1 = new ArrayList<>();
+        orderItems1.add(new AbstractMap.SimpleEntry<>(itemsDatabase.get(1), 5));
+        orderItems1.add(new AbstractMap.SimpleEntry<>(itemsDatabase.get(2), 3));
+
+        List<Map.Entry<Item, Integer>> orderItems2 = new ArrayList<>();  // Заказ для нового пользователя
+        orderItems2.add(new AbstractMap.SimpleEntry<>(itemsDatabase.get(3), 1));
+        orderItems2.add(new AbstractMap.SimpleEntry<>(itemsDatabase.get(1), 2));
+
+        // Размещение заказов в разное время
+        user1.placeOrder(orderItems1, store, LocalDateTime.of(2025, 6, 7, 12, 0));
+        user2.placeOrder(orderItems2, store, LocalDateTime.of(2025, 6, 7, 12, 30));  // Заказ на 30 минут позже
+
+        store.processOrders();
+    }
+}
