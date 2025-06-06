@@ -1,0 +1,674 @@
+import java.util.*;
+import java.time.*;
+import java.time.temporal.ChronoUnit;
+import java.time.format.DateTimeFormatter;
+
+class Constants {
+    public static final int HOURLY_RATE = 300;
+    public static final int ASSEMBLY_TIME_PER_ITEM = 45;
+    public static final int COURIER_PREP_TIME = 120;
+    public static final int TRAVEL_TIME_PER_UNIT = 30;
+    public static final int DEFAULT_RESTOCK_AMOUNT = 20;
+    public static final DateTimeFormatter FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
+}
+
+enum OrderStatus {
+    CREATED, PROCESSING, ASSEMBLING, SENT, DELIVERED
+}
+
+enum WorkerStatus {
+    NOT_WORKING, SHIFT_OPEN, HAS_ORDER, RETURNING
+}
+
+class Item {
+    private final String name;
+    private final int idInStore;
+    private final int idInProvider;
+    private final int price;
+    private final int providerId;
+
+    public Item(String name, int idInStore, int idInProvider, int price, int providerId) {
+        this.name = name;
+        this.idInStore = idInStore;
+        this.idInProvider = idInProvider;
+        this.price = price;
+        this.providerId = providerId;
+    }
+
+    public String getName() { return name; }
+    public int getIdInStore() { return idInStore; }
+    public int getIdInProvider() { return idInProvider; }
+    public int getProviderId() { return providerId; }
+    public int getPrice() { return price; }
+}
+
+class Order {
+    private static final Random random = new Random();
+    private final List<Map.Entry<Item, Integer>> goods;
+    private final double[] geolocation;
+    private final LocalDateTime orderCreation;
+    private final int orderId;
+    private OrderStatus status;
+    private Integer storekeeperId;
+    private Integer courierId;
+    private LocalDateTime orderDeliveryTime;
+    private final List<Map.Entry<Item, Integer>> goodsInFact = new ArrayList<>();
+
+    public Order(List<Map.Entry<Item, Integer>> goods, double[] geolocation, LocalDateTime orderCreation) {
+        this.goods = goods;
+        this.geolocation = geolocation;
+        this.orderCreation = orderCreation;
+        this.orderId = random.nextInt(100) + 1;
+        this.status = OrderStatus.CREATED;
+    }
+
+    public List<Map.Entry<Item, Integer>> getGoodsList() { return goods; }
+    public List<Map.Entry<Item, Integer>> getFactGoodsList() { return goodsInFact; }
+    public OrderStatus getStatus() { return status; }
+    public int getOrderId() { return orderId; }
+    public LocalDateTime getCreationTime() { return orderCreation; }
+    public LocalDateTime getDeliveryTime() { return orderDeliveryTime; }
+    public Integer getStorekeeperId() { return storekeeperId; }
+    public Integer getCourierId() { return courierId; }
+    public double[] getGeolocation() { return geolocation; }
+
+    public void setDeliveryTime(LocalDateTime time) { orderDeliveryTime = time; }
+    public void setStorekeeperId(int id) { if (storekeeperId == null) storekeeperId = id; }
+    public void setCourierId(int id) { if (courierId == null) courierId = id; }
+
+    public void nextStatus() {
+        if (status.ordinal() < OrderStatus.values().length - 1) {
+            status = OrderStatus.values()[status.ordinal() + 1];
+        }
+    }
+
+    public void addToFactGoods(Item item, int amount) {
+        goodsInFact.add(new AbstractMap.SimpleEntry<>(item, amount));
+    }
+}
+
+abstract class Worker {
+    protected final int id;
+    protected WorkerStatus status;
+    protected LocalDateTime startShift;
+    protected LocalDateTime endShift;
+    protected Order currentOrder;
+    protected LocalDateTime endTimeWorkingCurrentOrder;
+    protected double[] geolocation;
+    protected int wallet;
+    protected static final Random random = new Random();
+
+    public Worker() {
+        this.id = random.nextInt(1000) + 1;
+        this.status = WorkerStatus.NOT_WORKING;
+    }
+
+    public int getId() { return id; }
+    public WorkerStatus getStatus() { return status; }
+    public LocalDateTime getStartShift() { return startShift; }
+    public LocalDateTime getEndShift() { return endShift; }
+    public Order getCurrentOrder() { return currentOrder; }
+    public LocalDateTime getEndTimeWorkingCurrentOrder() { return endTimeWorkingCurrentOrder; }
+
+    public boolean acceptOrder(Order order, LocalDateTime time) {
+        closeShiftIfEnded(time);
+        if (status == WorkerStatus.SHIFT_OPEN &&
+                !time.isBefore(startShift) && !time.isAfter(endShift)) {
+            currentOrder = order;
+            status = WorkerStatus.HAS_ORDER;
+            return true;
+        }
+        return false;
+    }
+
+    public void startShift(LocalDateTime dateStart, LocalDateTime dateEnd, double[] storeGeolocation) {
+        if (status == WorkerStatus.NOT_WORKING) {
+            startShift = dateStart;
+            geolocation = storeGeolocation;
+            endShift = dateEnd;
+            status = WorkerStatus.SHIFT_OPEN;
+        }
+    }
+
+    public void closeShiftIfEnded(LocalDateTime currentTimestamp, boolean force) {
+        if (force || (endShift != null && currentTimestamp != null && currentTimestamp.isAfter(endShift))) {
+            status = WorkerStatus.NOT_WORKING;
+            long hours = ChronoUnit.HOURS.between(startShift, endShift);
+            wallet = (int) (hours * Constants.HOURLY_RATE);
+
+            System.out.println("------------Worker #" + id + "------------");
+            System.out.println("Worker " + id + " ended shift at " + endShift.format(Constants.FORMATTER) + ", earned " + wallet + " RUB\n");
+
+            startShift = null;
+            endShift = null;
+            currentOrder = null;
+            endTimeWorkingCurrentOrder = null;
+        }
+    }
+
+    public void closeShiftIfEnded(LocalDateTime currentTimestamp) {
+        closeShiftIfEnded(currentTimestamp, false);
+    }
+
+    public void checkOrderCompletion(LocalDateTime currentTime) {
+        if (status == WorkerStatus.HAS_ORDER &&
+                endTimeWorkingCurrentOrder != null &&
+                !currentTime.isBefore(endTimeWorkingCurrentOrder)) {
+
+            status = WorkerStatus.SHIFT_OPEN;
+            currentOrder = null;
+            endTimeWorkingCurrentOrder = null;
+        }
+    }
+}
+
+class Courier extends Worker {
+    private LocalDateTime returnTime;
+
+    public Courier() {
+        super();
+    }
+
+    public LocalDateTime getDeliveryTime() {
+        return endTimeWorkingCurrentOrder;
+    }
+
+    public void calculateDeliveryTime(LocalDateTime startTime) {
+        double dx = currentOrder.getGeolocation()[0] - geolocation[0];
+        double dy = currentOrder.getGeolocation()[1] - geolocation[1];
+        double distance = Math.sqrt(dx*dx + dy*dy);
+
+        long seconds = (long)(distance * Constants.TRAVEL_TIME_PER_UNIT)
+                + Constants.COURIER_PREP_TIME;
+
+        endTimeWorkingCurrentOrder = startTime.plusSeconds(seconds);
+        currentOrder.setDeliveryTime(endTimeWorkingCurrentOrder);
+    }
+
+    public void startReturn(LocalDateTime deliveryTime) {
+        double dx = geolocation[0] - currentOrder.getGeolocation()[0];
+        double dy = geolocation[1] - currentOrder.getGeolocation()[1];
+        double distance = Math.sqrt(dx*dx + dy*dy);
+
+        returnTime = deliveryTime.plusSeconds(
+                (long)(distance * Constants.TRAVEL_TIME_PER_UNIT)
+        );
+        status = WorkerStatus.RETURNING;
+    }
+
+    public boolean isReturnComplete(LocalDateTime currentTime) {
+        if (status == WorkerStatus.RETURNING &&
+                returnTime != null &&
+                currentTime.isAfter(returnTime)) {
+            status = WorkerStatus.SHIFT_OPEN;
+            currentOrder = null;
+            return true;
+        }
+        return false;
+    }
+
+    @Override
+    public void checkOrderCompletion(LocalDateTime currentTime) {
+        if (status == WorkerStatus.RETURNING) {
+            isReturnComplete(currentTime);
+        }
+        super.checkOrderCompletion(currentTime);
+    }
+}
+
+class Storekeeper extends Worker {
+    public Storekeeper() {
+        super();
+    }
+
+    public void calculateAssemblyTime(LocalDateTime startTime, Map<Integer, Integer> storeStock) {
+        int assemblyTime = 0;
+        for (Map.Entry<Item, Integer> entry : currentOrder.getGoodsList()) {
+            Item item = entry.getKey();
+            int amount = entry.getValue();
+            int storeId = item.getIdInStore();
+
+            if (storeStock.containsKey(storeId)) {
+                int available = storeStock.get(storeId);
+                int taken = Math.min(available, amount);
+                assemblyTime += Constants.ASSEMBLY_TIME_PER_ITEM * taken;
+                currentOrder.addToFactGoods(item, taken);
+                storeStock.put(storeId, available - taken);
+            }
+        }
+        endTimeWorkingCurrentOrder = startTime.plusSeconds(assemblyTime);
+    }
+
+    public LocalDateTime getAssemblyEndTime() {
+        return endTimeWorkingCurrentOrder;
+    }
+}
+
+class Provider {
+    private final int id;
+    private final Map<Integer, Integer> stock = new HashMap<>();
+    private final Map<Integer, Item> items = new HashMap<>();
+
+    public Provider(int id, Map<Integer, Item> itemsDatabase) {
+        this.id = id;
+        initializeItems(itemsDatabase);
+        restock();
+    }
+
+    private void initializeItems(Map<Integer, Item> itemsDatabase) {
+        itemsDatabase.values().stream()
+                .filter(item -> item.getProviderId() == id)
+                .forEach(item -> items.put(item.getIdInProvider(), item));
+    }
+
+    public void restock() {
+        items.keySet().forEach(itemId ->
+                stock.put(itemId, Constants.DEFAULT_RESTOCK_AMOUNT));
+    }
+
+    public List<Map.Entry<Item, Integer>> fulfillOrder(List<Map.Entry<Item, Integer>> orderItems) {
+        List<Map.Entry<Item, Integer>> fulfilled = new ArrayList<>();
+
+        for (Map.Entry<Item, Integer> entry : orderItems) {
+            Item item = entry.getKey();
+            int requested = entry.getValue();
+            int available = stock.getOrDefault(item.getIdInProvider(), 0);
+            int toSupply = Math.min(available, requested);
+
+            if (toSupply > 0) {
+                fulfilled.add(new AbstractMap.SimpleEntry<>(item, toSupply));
+                stock.put(item.getIdInProvider(), available - toSupply);
+            }
+        }
+        return fulfilled;
+    }
+
+    public int getId() { return id; }
+}
+
+interface AssignmentStrategy {
+    Worker assignWorker(Order order, List<Worker> availableWorkers, LocalDateTime currentTime);
+}
+
+class DefaultAssignmentStrategy implements AssignmentStrategy {
+    @Override
+    public Worker assignWorker(Order order, List<Worker> availableWorkers, LocalDateTime currentTime) {
+        return availableWorkers.stream()
+                .filter(worker -> worker.acceptOrder(order, currentTime))
+                .findFirst()
+                .orElse(null);
+    }
+}
+
+// ================== EVENT SYSTEM ==================
+abstract class Event implements Comparable<Event> {
+    protected final LocalDateTime time;
+
+    public Event(LocalDateTime time) {
+        this.time = time;
+    }
+
+    public LocalDateTime getTime() {
+        return time;
+    }
+
+    public abstract void execute(EventScheduler scheduler);
+
+    @Override
+    public int compareTo(Event other) {
+        return this.time.compareTo(other.time);
+    }
+}
+
+class OrderEvent extends Event {
+    private final Order order;
+    private final Store store;
+
+    public OrderEvent(LocalDateTime time, Order order, Store store) {
+        super(time);
+        this.order = order;
+        this.store = store;
+    }
+
+    @Override
+    public void execute(EventScheduler scheduler) {
+        store.processOrder(order, time, scheduler);
+    }
+}
+
+class CompletionEvent extends Event {
+    private final Worker worker;
+    private final Store store;
+
+    public CompletionEvent(LocalDateTime time, Worker worker, Store store) {
+        super(time);
+        this.worker = worker;
+        this.store = store;
+    }
+
+    @Override
+    public void execute(EventScheduler scheduler) {
+        worker.checkOrderCompletion(time);
+        store.checkPendingOrders(time, scheduler);
+    }
+}
+
+class ReturnEvent extends Event {
+    private final Courier courier;
+    private final Store store;
+
+    public ReturnEvent(LocalDateTime time, Courier courier, Store store) {
+        super(time);
+        this.courier = courier;
+        this.store = store;
+    }
+
+    @Override
+    public void execute(EventScheduler scheduler) {
+        courier.isReturnComplete(time);
+        store.checkPendingOrders(time, scheduler);
+    }
+}
+
+class ShiftEndEvent extends Event {
+    private final Worker worker;
+
+    public ShiftEndEvent(LocalDateTime time, Worker worker) {
+        super(time);
+        this.worker = worker;
+    }
+
+    @Override
+    public void execute(EventScheduler scheduler) {
+        worker.closeShiftIfEnded(time, true);
+    }
+}
+
+class EventScheduler {
+    private final PriorityQueue<Event> eventQueue = new PriorityQueue<>();
+
+    public void addEvent(Event event) {
+        eventQueue.add(event);
+    }
+
+    public void run() {
+        while (!eventQueue.isEmpty()) {
+            Event event = eventQueue.poll();
+            System.out.println("\n[EVENT] Processing at " + event.getTime().format(Constants.FORMATTER) +
+                    " (" + event.getClass().getSimpleName() + ")");
+            event.execute(this);
+        }
+    }
+}
+// ================== END EVENT SYSTEM ==================
+
+class Store {
+    private final int id;
+    private final double[] geolocation;
+    private final Queue<Order> pendingOrders = new LinkedList<>();
+    private final Map<Integer, Provider> providers = new HashMap<>();
+    private final List<Courier> couriers = new ArrayList<>();
+    private final List<Storekeeper> storekeepers = new ArrayList<>();
+    private final Map<Integer, Integer> stock = new HashMap<>();
+    private final Map<Integer, Item> items = new HashMap<>();
+    private final AssignmentStrategy assignmentStrategy;
+    private final Random random = new Random();
+
+    public Store(double[] geolocation, Map<Integer, Item> itemsDatabase, AssignmentStrategy strategy) {
+        this.id = random.nextInt(1000) + 1;
+        this.geolocation = geolocation;
+        this.items.putAll(itemsDatabase);
+        this.assignmentStrategy = strategy;
+        initializeStock();
+    }
+
+    public double[] getGeolocation() {
+        return this.geolocation;
+    }
+
+    private void initializeStock() {
+        items.values().forEach(item -> stock.put(item.getIdInStore(), 0));
+    }
+
+    public void addProvider(Provider provider) {
+        providers.put(provider.getId(), provider);
+    }
+
+    public void addWorker(Worker worker) {
+        if (worker instanceof Courier) {
+            couriers.add((Courier) worker);
+        } else if (worker instanceof Storekeeper) {
+            storekeepers.add((Storekeeper) worker);
+        }
+    }
+
+    public void addOrder(Order order) {
+        pendingOrders.add(order);
+    }
+
+    public void processOrder(Order order, LocalDateTime currentTime, EventScheduler scheduler) {
+        cleanEndedShifts(currentTime);
+
+        System.out.println("------------Order #" + order.getOrderId() + "------------");
+        System.out.println("Processing at: " + currentTime.format(Constants.FORMATTER));
+        System.out.println("Status: " + order.getStatus());
+
+        switch (order.getStatus()) {
+            case CREATED -> handleCreated(order, currentTime, scheduler);
+            case PROCESSING -> handleProcessing(order, currentTime, scheduler);
+            case ASSEMBLING -> handleAssembling(order, currentTime, scheduler);
+            case SENT -> handleSent(order, currentTime, scheduler);
+        }
+    }
+
+    private void handleCreated(Order order, LocalDateTime currentTime, EventScheduler scheduler) {
+        System.out.println("Created at: " + currentTime.format(Constants.FORMATTER));
+        order.nextStatus();
+        scheduler.addEvent(new OrderEvent(currentTime, order, this));
+        checkStockLevels();
+    }
+
+    private void handleProcessing(Order order, LocalDateTime currentTime, EventScheduler scheduler) {
+        Worker worker = assignmentStrategy.assignWorker(order, new ArrayList<>(storekeepers), currentTime);
+
+        if (worker != null) {
+            Storekeeper storekeeper = (Storekeeper) worker;
+            storekeeper.calculateAssemblyTime(currentTime, stock);
+            order.setStorekeeperId(worker.getId());
+            order.nextStatus();
+
+            // Schedule assembly completion
+            scheduler.addEvent(new CompletionEvent(storekeeper.getAssemblyEndTime(), storekeeper, this));
+            System.out.println("Order #" + order.getOrderId() + " assigned to storekeeper");
+            System.out.println("Assembly will complete at: " + storekeeper.getAssemblyEndTime().format(Constants.FORMATTER));
+        } else {
+            rescheduleOrder(order, currentTime, scheduler, storekeepers);
+        }
+    }
+
+    private void handleAssembling(Order order, LocalDateTime currentTime, EventScheduler scheduler) {
+        Worker worker = assignmentStrategy.assignWorker(order, new ArrayList<>(couriers), currentTime);
+
+        if (worker != null) {
+            Courier courier = (Courier) worker;
+            courier.calculateDeliveryTime(currentTime);
+            order.setCourierId(worker.getId());
+            order.nextStatus();
+
+            // Schedule delivery completion
+            scheduler.addEvent(new CompletionEvent(courier.getDeliveryTime(), courier, this));
+            System.out.println("Order #" + order.getOrderId() + " assigned to courier");
+            System.out.println("Delivery will complete at: " + courier.getDeliveryTime().format(Constants.FORMATTER));
+        } else {
+            rescheduleOrder(order, currentTime, scheduler, couriers);
+        }
+    }
+
+    private void handleSent(Order order, LocalDateTime currentTime, EventScheduler scheduler) {
+        System.out.println("------------Order #" + order.getOrderId() + "------------");
+        System.out.println("Delivered at: " + order.getDeliveryTime().format(Constants.FORMATTER));
+
+        for (Courier courier : couriers) {
+            if (courier.getId() == order.getCourierId()) {
+                courier.startReturn(order.getDeliveryTime());
+                // Schedule return completion
+                scheduler.addEvent(new ReturnEvent(courier.getDeliveryTime().plusSeconds(120), courier, this));
+                break;
+            }
+        }
+    }
+
+    private void rescheduleOrder(Order order, LocalDateTime currentTime,
+                                 EventScheduler scheduler, List<? extends Worker> workers) {
+        LocalDateTime nextCheck = workers.stream()
+                .filter(w -> w.getStatus() == WorkerStatus.HAS_ORDER || w.getStatus() == WorkerStatus.RETURNING)
+                .map(Worker::getEndTimeWorkingCurrentOrder)
+                .filter(Objects::nonNull)
+                .min(LocalDateTime::compareTo)
+                .orElse(currentTime.plusMinutes(5));
+
+        scheduler.addEvent(new OrderEvent(nextCheck, order, this));
+        System.out.println("Rescheduling order #" + order.getOrderId() + " to " + nextCheck.format(Constants.FORMATTER));
+    }
+
+    public void checkPendingOrders(LocalDateTime currentTime, EventScheduler scheduler) {
+        List<Order> ordersToProcess = new ArrayList<>(pendingOrders);
+        pendingOrders.clear();
+
+        for (Order order : ordersToProcess) {
+            scheduler.addEvent(new OrderEvent(currentTime, order, this));
+        }
+    }
+
+    private void checkStockLevels() {
+        Map<Integer, List<Map.Entry<Item, Integer>>> restockRequests = new HashMap<>();
+
+        stock.entrySet().stream()
+                .filter(entry -> entry.getValue() == 0)
+                .forEach(entry -> {
+                    Item item = items.get(entry.getKey());
+                    int providerId = item.getProviderId();
+                    restockRequests.computeIfAbsent(providerId, k -> new ArrayList<>())
+                            .add(new AbstractMap.SimpleEntry<>(item, Constants.DEFAULT_RESTOCK_AMOUNT));
+                });
+
+        if (!restockRequests.isEmpty()) {
+            System.out.println("------------Store #" + id + "------------");
+            System.out.print("Restocking needed for: ");
+            restockRequests.values().stream()
+                    .flatMap(List::stream)
+                    .map(entry -> entry.getKey().getName())
+                    .forEach(name -> System.out.print(name + ", "));
+            System.out.println();
+        }
+
+        restockRequests.forEach((providerId, itemsList) -> {
+            Provider provider = providers.get(providerId);
+            List<Map.Entry<Item, Integer>> fulfilled = provider.fulfillOrder(itemsList);
+            fulfilled.forEach(entry ->
+                    stock.compute(entry.getKey().getIdInStore(),
+                            (k, v) -> v + entry.getValue()));
+        });
+    }
+
+    private void cleanEndedShifts(LocalDateTime currentTime) {
+        for (Courier courier : couriers) {
+            courier.closeShiftIfEnded(currentTime);
+        }
+        for (Storekeeper storekeeper : storekeepers) {
+            storekeeper.closeShiftIfEnded(currentTime);
+        }
+    }
+}
+
+class User {
+    private final String email;
+    private final double[] geolocation;
+    private final int id;
+    private final List<Order> orders = new ArrayList<>();
+    private static final Random random = new Random();
+
+    public User(String email, double[] geolocation) {
+        this.email = email;
+        this.geolocation = geolocation;
+        this.id = random.nextInt(100) + 1;
+    }
+
+    public void placeOrder(List<Map.Entry<Item, Integer>> items, Store store, LocalDateTime time, EventScheduler scheduler) {
+        Order order = new Order(items, geolocation, time);
+        orders.add(order);
+        store.addOrder(order);
+        scheduler.addEvent(new OrderEvent(time, order, store));
+        System.out.println("User #" + id + " placed order #" + order.getOrderId() + " at " + time.format(Constants.FORMATTER));
+    }
+}
+
+public class Main {
+    public static void main(String[] args) {
+        // Инициализация базы товаров
+        Map<Integer, Item> itemsDatabase = new HashMap<>();
+        itemsDatabase.put(1, new Item("Backpack", 1, 28, 400, 50));
+        itemsDatabase.put(2, new Item("Notebook", 2, 36, 50, 50));
+        itemsDatabase.put(3, new Item("Laptop", 3, 4, 10000, 50));
+
+        // Создание склада
+        Store store = new Store(
+                new double[]{0, 0},
+                itemsDatabase,
+                new DefaultAssignmentStrategy()
+        );
+
+        // Добавление поставщика
+        Provider provider = new Provider(50, itemsDatabase);
+        store.addProvider(provider);
+
+        // Создание работников
+        Courier courier = new Courier();
+        Courier courier2 = new Courier(); // Дополнительный курьер
+        Storekeeper storekeeper = new Storekeeper();
+        Storekeeper storekeeper2 = new Storekeeper(); // Дополнительный кладовщик
+
+        store.addWorker(courier);
+        store.addWorker(courier2);
+        store.addWorker(storekeeper);
+        store.addWorker(storekeeper2);
+
+        // Назначение смен
+        LocalDateTime shiftStart = LocalDateTime.of(2025, 6, 7, 9, 0);
+        LocalDateTime shiftEnd = LocalDateTime.of(2025, 6, 7, 14, 5);
+
+        courier.startShift(shiftStart, shiftEnd, store.getGeolocation());
+        courier2.startShift(shiftStart, shiftEnd, store.getGeolocation());
+        storekeeper.startShift(shiftStart, shiftEnd, store.getGeolocation());
+        storekeeper2.startShift(shiftStart, shiftEnd, store.getGeolocation());
+
+        // Создание пользователей
+        User user1 = new User("user1@example.com", new double[]{10, 10});
+        User user2 = new User("user2@example.com", new double[]{-5, 7});
+
+        // Создание планировщика событий
+        EventScheduler scheduler = new EventScheduler();
+
+        // Формирование заказов
+        List<Map.Entry<Item, Integer>> orderItems1 = new ArrayList<>();
+        orderItems1.add(new AbstractMap.SimpleEntry<>(itemsDatabase.get(1), 5));
+        orderItems1.add(new AbstractMap.SimpleEntry<>(itemsDatabase.get(2), 3));
+
+        List<Map.Entry<Item, Integer>> orderItems2 = new ArrayList<>();
+        orderItems2.add(new AbstractMap.SimpleEntry<>(itemsDatabase.get(3), 1));
+        orderItems2.add(new AbstractMap.SimpleEntry<>(itemsDatabase.get(1), 2));
+
+        // Размещение заказов
+        user1.placeOrder(orderItems1, store, LocalDateTime.of(2025, 6, 7, 14, 0), scheduler);
+        user2.placeOrder(orderItems2, store, LocalDateTime.of(2025, 6, 7, 14, 1), scheduler);
+
+        // Завершение смен в конце дня
+        scheduler.addEvent(new ShiftEndEvent(shiftEnd.plusMinutes(1), courier));
+        scheduler.addEvent(new ShiftEndEvent(shiftEnd.plusMinutes(1), courier2));
+        scheduler.addEvent(new ShiftEndEvent(shiftEnd.plusMinutes(1), storekeeper));
+        scheduler.addEvent(new ShiftEndEvent(shiftEnd.plusMinutes(1), storekeeper2));
+
+        // Запуск симуляции
+        scheduler.run();
+    }
+}
