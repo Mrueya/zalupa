@@ -2,31 +2,22 @@ import java.util.*;
 import java.time.*;
 import java.time.temporal.ChronoUnit;
 import java.time.format.DateTimeFormatter;
-import java.util.concurrent.*;
-import java.util.stream.Collectors;
 
 class Constants {
-    public static final int HOURLY_RATE = 300;          // Ставка работников: 300 руб/час
-    public static final int ASSEMBLY_TIME_PER_ITEM = 45; // Время сборки 1 товара: 45 сек
-    public static final int COURIER_PREP_TIME = 120;     // Время подготовки курьера: 120 сек (60+60)
-    public static final int TRAVEL_TIME_PER_UNIT = 30;   // Время на 1 единицу расстояния: 30 сек
-    public static final int DEFAULT_RESTOCK_AMOUNT = 20; // Стандартное кол-во товара при пополнении
+    public static final int HOURLY_RATE = 300;
+    public static final int ASSEMBLY_TIME_PER_ITEM = 45;
+    public static final int COURIER_PREP_TIME = 120;
+    public static final int TRAVEL_TIME_PER_UNIT = 30;
+    public static final int DEFAULT_RESTOCK_AMOUNT = 20;
     public static final DateTimeFormatter FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
 }
 
 enum OrderStatus {
-    CREATED,      // Заказ создан
-    PROCESSING,   // Заказ в обработке
-    ASSEMBLING,   // Заказ собирается
-    SENT,         // Заказ отправлен курьером
-    DELIVERED     // Заказ доставлен
+    CREATED, PROCESSING, ASSEMBLING, SENT, DELIVERED
 }
 
 enum WorkerStatus {
-    NOT_WORKING,  // Работник не на смене
-    SHIFT_OPEN,   // Смена начата
-    HAS_ORDER,    // Работник выполняет заказ
-    RETURNING     // Курьер возвращается на склад
+    NOT_WORKING, SHIFT_OPEN, HAS_ORDER, RETURNING
 }
 
 class Item {
@@ -51,17 +42,17 @@ class Item {
     public int getPrice() { return price; }
 }
 
-class Order implements Comparable<Order> {
+class Order {
     private static final Random random = new Random();
-    private final List<Map.Entry<Item, Integer>> goods; //Состав заказа (Список пар "Товар-Количество")
+    private final List<Map.Entry<Item, Integer>> goods;
     private final double[] geolocation;
-    private final LocalDateTime orderCreation; // Дата и время создания
+    private final LocalDateTime orderCreation;
     private final int orderId;
     private OrderStatus status;
     private Integer storekeeperId;
     private Integer courierId;
-    private LocalDateTime orderDeliveryTime; //Дата и время фактической доставки
-    private final List<Map.Entry<Item, Integer>> goodsInFact = new ArrayList<>(); //Список фактически собранных товаров
+    private LocalDateTime orderDeliveryTime;
+    private final List<Map.Entry<Item, Integer>> goodsInFact = new ArrayList<>();
 
     public Order(List<Map.Entry<Item, Integer>> goods, double[] geolocation, LocalDateTime orderCreation) {
         this.goods = goods;
@@ -69,11 +60,6 @@ class Order implements Comparable<Order> {
         this.orderCreation = orderCreation;
         this.orderId = random.nextInt(100) + 1;
         this.status = OrderStatus.CREATED;
-    }
-
-    @Override
-    public int compareTo(Order other) { //Сортировка во время сборки
-        return this.orderCreation.compareTo(other.orderCreation);
     }
 
     public List<Map.Entry<Item, Integer>> getGoodsList() { return goods; }
@@ -151,7 +137,6 @@ abstract class Worker {
             wallet = (int) (hours * Constants.HOURLY_RATE);
 
             System.out.println("------------Worker #" + id + "------------");
-            // Использование форматтера для вывода
             System.out.println("Worker " + id + " ended shift at " + endShift.format(Constants.FORMATTER) + ", earned " + wallet + " RUB\n");
 
             startShift = null;
@@ -178,7 +163,7 @@ abstract class Worker {
 }
 
 class Courier extends Worker {
-    private LocalDateTime returnTime; // Время возврата на склад
+    private LocalDateTime returnTime;
 
     public Courier() {
         super();
@@ -189,27 +174,22 @@ class Courier extends Worker {
     }
 
     public void calculateDeliveryTime(LocalDateTime startTime) {
-        // Расчет расстояния между складом и адресом доставки
         double dx = currentOrder.getGeolocation()[0] - geolocation[0];
         double dy = currentOrder.getGeolocation()[1] - geolocation[1];
         double distance = Math.sqrt(dx*dx + dy*dy);
 
-        // Расчет времени: расстояние × 30 сек + 120 сек
         long seconds = (long)(distance * Constants.TRAVEL_TIME_PER_UNIT)
                 + Constants.COURIER_PREP_TIME;
 
-        // Установка времени завершения доставки
         endTimeWorkingCurrentOrder = startTime.plusSeconds(seconds);
         currentOrder.setDeliveryTime(endTimeWorkingCurrentOrder);
     }
 
     public void startReturn(LocalDateTime deliveryTime) {
-        // Расчет расстояния от адреса доставки до склада
         double dx = geolocation[0] - currentOrder.getGeolocation()[0];
         double dy = geolocation[1] - currentOrder.getGeolocation()[1];
         double distance = Math.sqrt(dx*dx + dy*dy);
 
-        // Расчет времени возврата
         returnTime = deliveryTime.plusSeconds(
                 (long)(distance * Constants.TRAVEL_TIME_PER_UNIT)
         );
@@ -221,7 +201,7 @@ class Courier extends Worker {
                 returnTime != null &&
                 currentTime.isAfter(returnTime)) {
             status = WorkerStatus.SHIFT_OPEN;
-            currentOrder = null; // Заказ полностью завершен
+            currentOrder = null;
             return true;
         }
         return false;
@@ -229,12 +209,8 @@ class Courier extends Worker {
 
     @Override
     public void checkOrderCompletion(LocalDateTime currentTime) {
-        if (status == WorkerStatus.RETURNING &&
-                returnTime != null &&
-                !currentTime.isBefore(returnTime)) {
-
-            status = WorkerStatus.SHIFT_OPEN;
-            returnTime = null;
+        if (status == WorkerStatus.RETURNING) {
+            isReturnComplete(currentTime);
         }
         super.checkOrderCompletion(currentTime);
     }
@@ -324,10 +300,112 @@ class DefaultAssignmentStrategy implements AssignmentStrategy {
     }
 }
 
+// ================== EVENT SYSTEM ==================
+abstract class Event implements Comparable<Event> {
+    protected final LocalDateTime time;
+
+    public Event(LocalDateTime time) {
+        this.time = time;
+    }
+
+    public LocalDateTime getTime() {
+        return time;
+    }
+
+    public abstract void execute(EventScheduler scheduler);
+
+    @Override
+    public int compareTo(Event other) {
+        return this.time.compareTo(other.time);
+    }
+}
+
+class OrderEvent extends Event {
+    private final Order order;
+    private final Store store;
+
+    public OrderEvent(LocalDateTime time, Order order, Store store) {
+        super(time);
+        this.order = order;
+        this.store = store;
+    }
+
+    @Override
+    public void execute(EventScheduler scheduler) {
+        store.processOrder(order, time, scheduler);
+    }
+}
+
+class CompletionEvent extends Event {
+    private final Worker worker;
+    private final Store store;
+
+    public CompletionEvent(LocalDateTime time, Worker worker, Store store) {
+        super(time);
+        this.worker = worker;
+        this.store = store;
+    }
+
+    @Override
+    public void execute(EventScheduler scheduler) {
+        worker.checkOrderCompletion(time);
+        store.checkPendingOrders(time, scheduler);
+    }
+}
+
+class ReturnEvent extends Event {
+    private final Courier courier;
+    private final Store store;
+
+    public ReturnEvent(LocalDateTime time, Courier courier, Store store) {
+        super(time);
+        this.courier = courier;
+        this.store = store;
+    }
+
+    @Override
+    public void execute(EventScheduler scheduler) {
+        courier.isReturnComplete(time);
+        store.checkPendingOrders(time, scheduler);
+    }
+}
+
+class ShiftEndEvent extends Event {
+    private final Worker worker;
+
+    public ShiftEndEvent(LocalDateTime time, Worker worker) {
+        super(time);
+        this.worker = worker;
+    }
+
+    @Override
+    public void execute(EventScheduler scheduler) {
+        worker.closeShiftIfEnded(time, true);
+    }
+}
+
+class EventScheduler {
+    private final PriorityQueue<Event> eventQueue = new PriorityQueue<>();
+
+    public void addEvent(Event event) {
+        eventQueue.add(event);
+    }
+
+    public void run() {
+        while (!eventQueue.isEmpty()) {
+            Event event = eventQueue.poll();
+            System.out.println("\n[EVENT] Processing at " + event.getTime().format(Constants.FORMATTER) +
+                    " (" + event.getClass().getSimpleName() + ")");
+            event.execute(this);
+        }
+    }
+}
+// ================== END EVENT SYSTEM ==================
+
 class Store {
     private final int id;
     private final double[] geolocation;
-    private final PriorityBlockingQueue<Order> orderQueue = new PriorityBlockingQueue<>();
+    private final Queue<Order> pendingOrders = new LinkedList<>();
     private final Map<Integer, Provider> providers = new HashMap<>();
     private final List<Courier> couriers = new ArrayList<>();
     private final List<Storekeeper> storekeepers = new ArrayList<>();
@@ -365,65 +443,83 @@ class Store {
     }
 
     public void addOrder(Order order) {
-        orderQueue.add(order);
+        pendingOrders.add(order);
     }
 
-    public void processOrders() {
-        while (!orderQueue.isEmpty()) {
-            Order order = orderQueue.poll();
-            LocalDateTime currentTime = order.getCreationTime();
+    public void processOrder(Order order, LocalDateTime currentTime, EventScheduler scheduler) {
+        cleanEndedShifts(currentTime);
 
-            cleanEndedShifts(currentTime);
-
-            switch (order.getStatus()) {
-                case CREATED -> processCreatedOrder(order, currentTime);
-                case PROCESSING -> processProcessingOrder(order, currentTime);
-                case ASSEMBLING -> processAssemblingOrder(order, currentTime);
-                case SENT -> completeOrder(order);
-            }
-        }
-        finalizeOperations();
-    }
-
-    private void processCreatedOrder(Order order, LocalDateTime currentTime) {
         System.out.println("------------Order #" + order.getOrderId() + "------------");
-        // Использование форматтера для вывода
-        System.out.println("Created at: " + currentTime.format(Constants.FORMATTER));
+        System.out.println("Processing at: " + currentTime.format(Constants.FORMATTER));
+        System.out.println("Status: " + order.getStatus());
 
+        switch (order.getStatus()) {
+            case CREATED -> handleCreated(order, currentTime, scheduler);
+            case PROCESSING -> handleProcessing(order, currentTime, scheduler);
+            case ASSEMBLING -> handleAssembling(order, currentTime, scheduler);
+            case SENT -> handleSent(order, currentTime, scheduler);
+        }
+    }
+
+    private void handleCreated(Order order, LocalDateTime currentTime, EventScheduler scheduler) {
+        System.out.println("Created at: " + currentTime.format(Constants.FORMATTER));
         order.nextStatus();
-        orderQueue.add(order);
+        scheduler.addEvent(new OrderEvent(currentTime, order, this));
         checkStockLevels();
     }
 
-    private void processProcessingOrder(Order order, LocalDateTime currentTime) {
+    private void handleProcessing(Order order, LocalDateTime currentTime, EventScheduler scheduler) {
         Worker worker = assignmentStrategy.assignWorker(order, new ArrayList<>(storekeepers), currentTime);
 
         if (worker != null) {
-            ((Storekeeper) worker).calculateAssemblyTime(currentTime, stock);
+            Storekeeper storekeeper = (Storekeeper) worker;
+            storekeeper.calculateAssemblyTime(currentTime, stock);
             order.setStorekeeperId(worker.getId());
             order.nextStatus();
-            orderQueue.add(order);
+
+            // Schedule assembly completion
+            scheduler.addEvent(new CompletionEvent(storekeeper.getAssemblyEndTime(), storekeeper, this));
             System.out.println("Order #" + order.getOrderId() + " assigned to storekeeper");
+            System.out.println("Assembly will complete at: " + storekeeper.getAssemblyEndTime().format(Constants.FORMATTER));
         } else {
-            rescheduleOrder(order, storekeepers, currentTime);
+            rescheduleOrder(order, currentTime, scheduler, storekeepers);
         }
     }
 
-    private void processAssemblingOrder(Order order, LocalDateTime currentTime) {
+    private void handleAssembling(Order order, LocalDateTime currentTime, EventScheduler scheduler) {
         Worker worker = assignmentStrategy.assignWorker(order, new ArrayList<>(couriers), currentTime);
 
         if (worker != null) {
-            ((Courier) worker).calculateDeliveryTime(currentTime);
+            Courier courier = (Courier) worker;
+            courier.calculateDeliveryTime(currentTime);
             order.setCourierId(worker.getId());
             order.nextStatus();
-            orderQueue.add(order);
+
+            // Schedule delivery completion
+            scheduler.addEvent(new CompletionEvent(courier.getDeliveryTime(), courier, this));
             System.out.println("Order #" + order.getOrderId() + " assigned to courier");
+            System.out.println("Delivery will complete at: " + courier.getDeliveryTime().format(Constants.FORMATTER));
         } else {
-            rescheduleOrder(order, couriers, currentTime);
+            rescheduleOrder(order, currentTime, scheduler, couriers);
         }
     }
 
-    private void rescheduleOrder(Order order, List<? extends Worker> workers, LocalDateTime currentTime) {
+    private void handleSent(Order order, LocalDateTime currentTime, EventScheduler scheduler) {
+        System.out.println("------------Order #" + order.getOrderId() + "------------");
+        System.out.println("Delivered at: " + order.getDeliveryTime().format(Constants.FORMATTER));
+
+        for (Courier courier : couriers) {
+            if (courier.getId() == order.getCourierId()) {
+                courier.startReturn(order.getDeliveryTime());
+                // Schedule return completion
+                scheduler.addEvent(new ReturnEvent(courier.getDeliveryTime().plusSeconds(120), courier, this));
+                break;
+            }
+        }
+    }
+
+    private void rescheduleOrder(Order order, LocalDateTime currentTime,
+                                 EventScheduler scheduler, List<? extends Worker> workers) {
         LocalDateTime nextCheck = workers.stream()
                 .filter(w -> w.getStatus() == WorkerStatus.HAS_ORDER || w.getStatus() == WorkerStatus.RETURNING)
                 .map(Worker::getEndTimeWorkingCurrentOrder)
@@ -431,21 +527,16 @@ class Store {
                 .min(LocalDateTime::compareTo)
                 .orElse(currentTime.plusMinutes(5));
 
-        orderQueue.add(order);
-        // Использование форматтера для вывода
+        scheduler.addEvent(new OrderEvent(nextCheck, order, this));
         System.out.println("Rescheduling order #" + order.getOrderId() + " to " + nextCheck.format(Constants.FORMATTER));
     }
 
-    private void completeOrder(Order order) {
-        System.out.println("------------Order #" + order.getOrderId() + "------------");
-        // Использование форматтера для вывода
-        System.out.println("Delivered at: " + order.getDeliveryTime().format(Constants.FORMATTER));
+    public void checkPendingOrders(LocalDateTime currentTime, EventScheduler scheduler) {
+        List<Order> ordersToProcess = new ArrayList<>(pendingOrders);
+        pendingOrders.clear();
 
-        for (Courier courier : couriers) {
-            if (courier.getId() == order.getCourierId()) {
-                courier.startReturn(order.getDeliveryTime());
-                break;
-            }
+        for (Order order : ordersToProcess) {
+            scheduler.addEvent(new OrderEvent(currentTime, order, this));
         }
     }
 
@@ -481,27 +572,12 @@ class Store {
     }
 
     private void cleanEndedShifts(LocalDateTime currentTime) {
-        // Для кладовщиков
-        for (Storekeeper storekeeper : storekeepers) {
-            storekeeper.checkOrderCompletion(currentTime);
-            storekeeper.closeShiftIfEnded(currentTime);
-        }
-
-        // Для курьеров
         for (Courier courier : couriers) {
-            courier.checkOrderCompletion(currentTime);
-            courier.isReturnComplete(currentTime); // Оставляем существующую проверку возврата
             courier.closeShiftIfEnded(currentTime);
         }
-    }
-
-    private void finalizeOperations() {
-        System.out.println("------------Store #" + id + "------------");
-        System.out.println("All orders processed");
-
-        // Принудительное завершение смен
-        couriers.forEach(c -> c.closeShiftIfEnded(null, true));
-        storekeepers.forEach(s -> s.closeShiftIfEnded(null, true));
+        for (Storekeeper storekeeper : storekeepers) {
+            storekeeper.closeShiftIfEnded(currentTime);
+        }
     }
 }
 
@@ -518,11 +594,12 @@ class User {
         this.id = random.nextInt(100) + 1;
     }
 
-    public void placeOrder(List<Map.Entry<Item, Integer>> items, Store store, LocalDateTime time) {
+    public void placeOrder(List<Map.Entry<Item, Integer>> items, Store store, LocalDateTime time, EventScheduler scheduler) {
         Order order = new Order(items, geolocation, time);
         orders.add(order);
         store.addOrder(order);
-        System.out.println("User #" + id + " placed order #" + order.getOrderId());
+        scheduler.addEvent(new OrderEvent(time, order, store));
+        System.out.println("User #" + id + " placed order #" + order.getOrderId() + " at " + time.format(Constants.FORMATTER));
     }
 }
 
@@ -547,33 +624,51 @@ public class Main {
 
         // Создание работников
         Courier courier = new Courier();
+        Courier courier2 = new Courier(); // Дополнительный курьер
         Storekeeper storekeeper = new Storekeeper();
+        Storekeeper storekeeper2 = new Storekeeper(); // Дополнительный кладовщик
+
         store.addWorker(courier);
+        store.addWorker(courier2);
         store.addWorker(storekeeper);
+        store.addWorker(storekeeper2);
 
         // Назначение смен
         LocalDateTime shiftStart = LocalDateTime.of(2025, 6, 7, 9, 0);
-        LocalDateTime shiftEnd = LocalDateTime.of(2025, 6, 7, 18, 0);
+        LocalDateTime shiftEnd = LocalDateTime.of(2025, 6, 7, 14, 5);
 
         courier.startShift(shiftStart, shiftEnd, store.getGeolocation());
+        courier2.startShift(shiftStart, shiftEnd, store.getGeolocation());
         storekeeper.startShift(shiftStart, shiftEnd, store.getGeolocation());
+        storekeeper2.startShift(shiftStart, shiftEnd, store.getGeolocation());
 
+        // Создание пользователей
         User user1 = new User("user1@example.com", new double[]{10, 10});
-        User user2 = new User("user2@example.com", new double[]{-5, 7});  // Новый пользователь
+        User user2 = new User("user2@example.com", new double[]{-5, 7});
+
+        // Создание планировщика событий
+        EventScheduler scheduler = new EventScheduler();
 
         // Формирование заказов
         List<Map.Entry<Item, Integer>> orderItems1 = new ArrayList<>();
         orderItems1.add(new AbstractMap.SimpleEntry<>(itemsDatabase.get(1), 5));
         orderItems1.add(new AbstractMap.SimpleEntry<>(itemsDatabase.get(2), 3));
 
-        List<Map.Entry<Item, Integer>> orderItems2 = new ArrayList<>();  // Заказ для нового пользователя
+        List<Map.Entry<Item, Integer>> orderItems2 = new ArrayList<>();
         orderItems2.add(new AbstractMap.SimpleEntry<>(itemsDatabase.get(3), 1));
         orderItems2.add(new AbstractMap.SimpleEntry<>(itemsDatabase.get(1), 2));
 
-        // Размещение заказов в разное время
-        user1.placeOrder(orderItems1, store, LocalDateTime.of(2025, 6, 7, 12, 0));
-        user2.placeOrder(orderItems2, store, LocalDateTime.of(2025, 6, 7, 12, 30));  // Заказ на 30 минут позже
+        // Размещение заказов
+        user1.placeOrder(orderItems1, store, LocalDateTime.of(2025, 6, 7, 14, 0), scheduler);
+        user2.placeOrder(orderItems2, store, LocalDateTime.of(2025, 6, 7, 14, 1), scheduler);
 
-        store.processOrders();
+        // Завершение смен в конце дня
+        scheduler.addEvent(new ShiftEndEvent(shiftEnd.plusMinutes(1), courier));
+        scheduler.addEvent(new ShiftEndEvent(shiftEnd.plusMinutes(1), courier2));
+        scheduler.addEvent(new ShiftEndEvent(shiftEnd.plusMinutes(1), storekeeper));
+        scheduler.addEvent(new ShiftEndEvent(shiftEnd.plusMinutes(1), storekeeper2));
+
+        // Запуск симуляции
+        scheduler.run();
     }
 }
